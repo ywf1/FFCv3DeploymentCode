@@ -1,0 +1,83 @@
+#ifndef FFCV3_PIN_DEF
+#define FFCV3_PIN_DEF
+
+//LSM6DSOX IMU
+#define LSM_CLK PE2
+#define LSM_MISO PE5
+#define LSM_MOSI PE6
+#define LSM_CS PC13
+#define LSM_INT2 PC1
+#define LSM_INT1 PA1
+
+//PYRO2 TRIGGER + CONTINUITY
+#define CONT2 PA2
+#define PYRO2 PA3
+
+//PYRO2 TRIGGER + CONTINUITY
+#define PYRO1 PC5
+#define CONT1 PB0
+
+#define LED_B PA0
+
+//FLASH MEMORY
+#define FLASH_CS PA4
+#define FLASH_CLK PA5
+#define FLASH_MISO PA6
+#define FLASH_MOSI PA7
+
+//BATTERY VOLTAGE
+#define VBAT PB1
+
+//GNSS UART CONNECTION
+#define GNSS_TX_RX_0 PE7
+#define GNSS_RX_TX_0 PE8
+
+//HIGH G-ACCELEROMETER
+#define ACCEL_INT2 PE9
+#define ACCEL_INT1 PE11
+#define ACCEL_SCL PB10
+#define ACCEL_SDA PB11
+
+//RUNCAM UART INTERFACE
+#define TX_1_RC_RX
+#define RX_1_RC_TX
+
+//SETING DIPSWITCH
+#define S1 PD8
+#define S0 PD9
+
+//PIEZO BUZZER
+#define BUZ PA_9
+
+//6DOF IMU WITH SENSOR FUSION
+#define BNO_INT PD11
+#define BNO_SCL PD12
+#define BNO_SDA PD13
+
+//BMP BAROMETER
+#define BMP_INT
+
+//MBP + MS5611 BAROMETER SHARE I2C BUS
+#define BAR_SCL PB6
+#define BAR_SDA PB7
+
+//SD CARD INTERFACE
+#define SD_CD PB14
+#define SDMMC_D0 PC8
+#define SDMMC_D1 PC9
+#define SDMMC_D2 PC10
+#define SDMMC_D3 PC11
+#define SDMMC_CLK PC12
+#define SDMMC_CMD PD2
+
+//SX1262 LORA CHIPSET INTERFACE
+#define ANT_SW PD10
+#define SX_RST PD3
+#define SX_BUSY PD4
+#define SX_DIO1 PD5
+#define SX_SCK PB3
+#define SX_MISO PB4
+#define SX_MISO PB5
+#define SX_NSS PE0
+
+#endif

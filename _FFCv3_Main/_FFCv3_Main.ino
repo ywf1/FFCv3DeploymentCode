@@ -1,11 +1,19 @@
 /*
 Yahya Farag
 Pitt SOAR
-2/2/2026
+6/5/2026
 */
 
-//Define Statment for Serial Terminal Debug, If commented DO NOT FLY
-#define FLIGHT
+/*
+Development TODO list (in order of prority):
+- 3 axis accel data - TODO
+- Initialize and setup HIGH G accel for logging 
+- update logging strucutre to accomodate high G, gyro, and 3 axis accel
+
+- EEPROM based inflight recovery
+- SPI FLASH data logging - TODO
+- beep out main altitude
+*/
 
 //Radio Transmitter Settings
 #define LORA_FREQ 926.375
@@ -14,18 +22,6 @@ Pitt SOAR
 
 #define mainChuteAltitude 334.0         // Altitude (in meters) to deploy main parachute
 
-// LOW PRIORITY:
-//Initialize and setup HIGH G accel - TODO
-//EEPROM based inflight recovery - TODO
-//SPI FLASH data logging - TODO
-//Receive activation signal for camera from ground station - TODO
-//camera control & feedback - TODO
-//link ANT_SW to radio controller - TODO
-//gyro data - todo
-//3 axis accel data - TODO
-//high G data - TODO
-
-//pinouts for FFCV3 Hardware
 #include "FFCV3_PIN_DEFINITION.h"
 
 #include <Wire.h>
@@ -64,7 +60,7 @@ Adafruit_LSM6DSOX lsm6dsox;                    // LSM6DSOX IMU sensor object
 BMP581 pressureSensor;
 File dataFile;                                 // SD Card file object
 SFE_UBLOX_GNSS myGNSS;
-Adafruit_ADXL375 accel = Adafruit_ADXL375(12345,&Wire2);
+Adafruit_ADXL375 highGaccel = Adafruit_ADXL375(12345,&Wire2);
 
 SX1262 radio = new Module(SX_NSS, SX_DIO1, SX_RST, SX_BUSY,SPI_6); //initialize radio object
 
@@ -72,10 +68,15 @@ SX1262 radio = new Module(SX_NSS, SX_DIO1, SX_RST, SX_BUSY,SPI_6); //initialize 
 #define numSamples 30 //# of values in moving average
 #define BUFF_SIZE 20
 
+bool serialDebug = false;
+
+bool radioEnabled = true; //set to false if operating radioless (IREC 2026)
+
 //camera vars (RunCamSplitv4)
 bool isCamera = true;
 uint8_t txBuf[BUFF_SIZE];
 int recState = 0;
+
 
 byte flightState = 0; //startup = 0, idle = 1, liftoff = 2, burnout = 3, apoggee & descent under drogue = 4, descent under main = 5, landing detected = 6;
 
@@ -94,17 +95,24 @@ double movingAvgAccel = 0.0;
 double lastAccel = 0.0;                         
 unsigned long accel_dt = 0;
 
+//gyro Vars
+float totalXrot = 0;
+float totalYrot = 0;
+float totalZrot = 0;
+
 double batteryVoltage = 0; //yeah
 
 // Timing Variables for Sampling delta time
 unsigned long lastBaroTime = 0;
 unsigned long lastAccelTime = 0;
+unsigned long lastGyroTime = 0;
+
 
 volatile unsigned long transmitPeriod = 1000000; //tranmit period for radio
 
 // Complementary Filter Variables
-double baroWeight = 0.9;
-double accelWeight = 0.1;
+double baroWeight = 0.0;
+double accelWeight = 0.0;
 double baroVelocity = 0.0;
 double accelVelocity = 0.0;
 double filteredVelocity = 0.0;
@@ -121,16 +129,16 @@ bool beeperState = false;
 
 //imu normalization
 int mainAxis = 2;                              // Axis to use for main acceleration (0=x, 1=y, 2=z)
-double imuFlip = 1.0;
-bool imuFlipped = false;
+double axisSign = 1.0;
 
 bool liftoffDetected = false;                  // Boolean to detect liftoff state
 bool apogeeDetected = false;                   // Boolean to detect apogee state
+bool burnoutDetected = false;                  //Boolean to detect motor burnout
 
 bool barBaselineSet = false;                      // Tracks if baseline pressure has been set
 bool accelBaselineSet = false;                    // Tracks if baseline accel has been set
 
-const double liftoffAccelThreshold = 3.0;       // Acceleration threshold for liftoff (in m/s^2)
+const double liftoffAccelThreshold = 25;       // Acceleration threshold for liftoff (in m/s^2)
 const double liftoffAltitudeThreshold = 50.0;   // Altitude threshold for liftoff (in meters)
 
 const unsigned long apogeeDelay = 1000000;     //Nose over delay time
@@ -160,6 +168,8 @@ volatile bool accelReady = false;
 
 volatile bool baroReady = false;
 
+volatile bool gyroReady = false;
+
 unsigned int packetNum = 0;
 
 
@@ -171,6 +181,12 @@ void accelIRQ(void){
 void baroIRQ(void){
   baroReady = true;
 }
+
+void gyroIRQ(void){
+  baroReady = true;
+}
+
+
 
 // save transmission state between loops
 volatile int transmissionState = RADIOLIB_ERR_NONE;
@@ -191,38 +207,39 @@ void setup() {
   pinMode(CONT1,INPUT_ANALOG); pinMode(CONT2,INPUT_ANALOG); pinMode(VBAT,INPUT_ANALOG);
   //RF Switch Pin
   pinMode(ANT_SW,OUTPUT); digitalWrite(ANT_SW,LOW);
-
   //Pin Setup
   pinMode(S0,INPUT);
-
   pinMode(PYRO1_DROG,OUTPUT); pinMode(PYRO2_MAIN,OUTPUT); pinMode(LED_B,OUTPUT);
   digitalWrite(PYRO1_DROG,LOW); digitalWrite(PYRO2_MAIN,LOW); digitalWrite(LED_B,LOW);
+
+  if(digitalRead(S0)){
+    serialDebug = true;
+  }
   
   delay(3000); //delay for connecting to Serial Terminal / sensors to start up
 
   digitalWrite(LED_B,HIGH);
 
-  #ifndef FLIGHT
-  Serial.begin(115200); //Serial Port (USB)
-  #endif
-
-  #ifndef FLIGHT
-  Serial.println("FFCv3 Initializing...");
-  #endif
+  if(serialDebug){
+    Serial.begin(115200); //Serial Port (USB)
+    Serial.println("FFCv3 Initializing...");
+  }
 
   /*
   SD SETUP
   */
 
-  #ifndef FLIGHT
-  Serial.println("Initializing SD Card ...");
-  #endif
+  if(serialDebug){
+    Serial.println("Initializing SD Card ...");
+  }
 
   //Set SD card to pins
   SD.setDx(SDMMC_D0, SDMMC_D1, SDMMC_D2, SDMMC_D3); SD.setCMD(SDMMC_CMD); SD.setCK(SDMMC_CLK);
 
   if (!SD.begin()) {
-    //Serial.println("initialization failed...");
+    if(serialDebug){
+      Serial.println("initialization failed...");
+    }
     errorCode1();
   }
 
@@ -236,30 +253,27 @@ void setup() {
   if (filenum > 9999) errorCode1();
   dataFile = SD.open(filename, FILE_WRITE);
   if (dataFile) {
-    #ifndef FLIGHT
-    Serial.println("SD Card File Found and Created");
-    #endif
+    if(serialDebug)
+      Serial.println("SD Card File Found and Created");
+
     dataFile.println("Time(us),Altitude(m),Acceleration(mps2),Baro Velocity(mps),Fused Velocity(mps),Accel Velocity(mps), Flight State, Latitude, Longitude, SIV");
     dataFile.flush();
   }
 
-  #ifndef FLIGHT
-  Serial.println("SD Initalized.");
-  #endif
+  if(serialDebug)
+    Serial.println("SD Initalized.");
 
   /*
   IMU SETUP
   */
 
-  #ifndef FLIGHT
-  Serial.println("Initializing IMU ...");
-  #endif
+  if(serialDebug)
+    Serial.println("Initializing IMU ...");
 
   // Initialize LSM6DSOX IMU over SPI
   if (!lsm6dsox.begin_SPI(LSM_CS,&SPI_4)) {
-    #ifndef FLIGHT
-    Serial.println("LSM6DSOX not detected. Check wiring.");
-    #endif
+    if(serialDebug)
+      Serial.println("LSM6DSOX not detected. Check wiring.");
     errorCode1();
   }
 
@@ -269,10 +283,52 @@ void setup() {
   lsm6dsox.configInt2(false,false,true); //Configure Innterupt when Accel Data Ready
   attachInterrupt(digitalPinToInterrupt(LSM_INT2), accelIRQ, RISING); // set interrupt pin for lsm6dsox acceleration data
 
-  #ifndef FLIGHT
-  Serial.println("IMU - GOOD");
-  #endif
+  //gyro setup
+  lsm6dsox.setGyroRange(LSM6DS_GYRO_RANGE_2000_DPS); // set gyro range to max
+  lsm6dsox.setGyroDataRate(LSM6DS_RATE_6_66K_HZ); //set gyro data rate
+  lsm6dsox.configInt1(false,true,false); //configure gyro int for
+  attachInterrupt(digitalPinToInterrupt(LSM_INT1), gyroIRQ, RISING); // set interrupt pin for lsm6dsox gyro data
+  delay(1000); //let imu normalize
 
+  // Determine primary axis for flight direction based on initial attitude
+  sensors_event_t accel;
+  lsm6dsox.getEvent(&accel, NULL, NULL);
+  double x = abs(accel.acceleration.x);
+  double y = abs(accel.acceleration.y);
+  double z = abs(accel.acceleration.z);
+
+  float rawX = accel.acceleration.x;
+  float rawY = accel.acceleration.y;
+  float rawZ = accel.acceleration.z;
+
+  // Find which axis has the largest absolute value (closest to +/- 9.81 m/s²)
+  if (abs(rawX) > abs(rawY) && abs(rawX) > abs(rawZ)) {
+    mainAxis = 0; // X is vertical
+    if (rawX > 0) {
+      axisSign = 1.0;
+    } else {
+      axisSign = -1.0;
+    }
+  } 
+  else if (abs(rawY) > abs(rawX) && abs(rawY) > abs(rawZ)) {
+    mainAxis = 1; // Y is vertical
+    if (rawY > 0) {
+      axisSign = 1.0;
+    } else {
+      axisSign = -1.0;
+    }
+  } 
+  else {
+    mainAxis = 2; // Z is vertical
+    if (rawZ > 0) {
+      axisSign = 1.0;
+    } else {
+      axisSign = -1.0;
+    }
+  }
+
+  if(serialDebug)
+    Serial.println("IMU - GOOD");
   /*
   BAROMETER SETUP
   */
@@ -282,9 +338,8 @@ void setup() {
   if(pressureSensor.beginI2C(BMP581_I2C_ADDRESS_SECONDARY) != BMP5_OK)
   {
     // Not connected, inform user
-    #ifndef FLIGHT
-    Serial.println("Error: BMP581 not connected, check wiring and I2C address!");
-    #endif
+    if(serialDebug)
+      Serial.println("Error: BMP581 not connected, check wiring and I2C address!");
 
     errorCode1();
   }
@@ -335,61 +390,53 @@ void setup() {
   // Setup interrupt handler for BMP581
   attachInterrupt(digitalPinToInterrupt(BMP_INT), baroIRQ, RISING);
 
-  #ifndef FLIGHT
-  Serial.println("BARO - GOOD");
-  #endif
+  if(serialDebug)
+    Serial.println("BARO - GOOD");
 
   /*
   Accel SETUP
   */
 
-  #ifndef FLIGHT
-  Serial.println("High G Accel Initalizing....");
-  #endif
-
+  if(serialDebug)
+    Serial.println("High G Accel Initalizing....");
   /* Initialise the sensor */
-  if(!accel.begin(0x1D))
+
+  if(!highGaccel.begin(0x1D))
   {
     errorCode1();
   }
 
-  accel.setDataRate(ADXL343_DATARATE_3200_HZ);
+  highGaccel.setDataRate(ADXL343_DATARATE_3200_HZ);
 
-  #ifndef FLIGHT
-  Serial.println("High G Accel Initialized");
-  #endif
+
+  if(serialDebug)
+    Serial.println("High G Accel Initialized");
 
   /*
   GNSS SETUP
   */
   
-  #ifndef FLIGHT
-  Serial.println("GNSS Initalizing....");
-  #endif
+  if(serialDebug)
+    Serial.println("GNSS Initalizing....");
 
   unsigned long gnssStart = millis();
 
   //Assume that the U-Blox GNSS is running at 9600 baud (the default) or at 38400 baud.
   //Loop until we're in sync and then ensure it's at 38400 baud.
   do {
-    #ifndef FLIGHT
-    //Serial.println("GNSS: trying 38400 baud");
-    #endif
 
     Serial7.begin(38400);
     if (myGNSS.begin(Serial7) == true) break;
 
     delay(100);
 
-    #ifndef FLIGHT
-    Serial.println("GNSS: trying 9600 baud");
-    #endif
+    if(serialDebug)
+      Serial.println("GNSS: trying 9600 baud");
 
     Serial7.begin(9600);
     if (myGNSS.begin(Serial7) == true) {
-      #ifndef FLIGHT
-      Serial.println("GNSS: connected at 9600 baud, switching to 38400");
-      #endif
+      if(serialDebug)
+        Serial.println("GNSS: connected at 9600 baud, switching to 38400");
       myGNSS.setSerialRate(38400);
       delay(100);
     } else {
@@ -401,18 +448,14 @@ void setup() {
     }
   } while(1);
   
-  #ifndef FLIGHT
-  Serial.println("GNSS serial connected");
-  #endif
+  if(serialDebug)
+    Serial.println("GNSS serial connected");
 
   myGNSS.setUART1Output(COM_TYPE_UBX); //Set the UART port to output UBX only
   myGNSS.setI2COutput(COM_TYPE_UBX); //Set the I2C port to output UBX only (turn off NMEA noise)
-
   //Set Navigation Frequency
   myGNSS.setNavigationFrequency(10); // 10 Hz
-
   // Set up auto PVT message (non-blocking)
- 
   myGNSS.setAutoPVT(true); // Enable automatic NAV PVT messages
   // Set up auto PVT message (non-blocking)
   myGNSS.setNavigationFrequency(10); // 1 Hz
@@ -421,52 +464,49 @@ void setup() {
   //Set Up Dynamic Mode
   if (myGNSS.setDynamicModel(DYN_MODEL_AIRBORNE4g) == false) // Set the dynamic model to PORTABLE
   {
-    Serial.println(F("*** Warning: setDynamicModel failed ***"));
+    if(serialDebug)
+      Serial.println(F("*** Warning: setDynamicModel failed ***"));
     errorCode1();
   }
   else
   {
-    #ifndef FLIGHT
-    Serial.println(F("Dynamic platform model changed successfully!"));
-    #endif
+    if(serialDebug)
+      Serial.println(F("Dynamic platform model changed successfully!"));
   }
 
-  #ifndef FLIGHT
-  // Let's read the new dynamic model to see if it worked
-  uint8_t newDynamicModel = myGNSS.getDynamicModel();
-  if (newDynamicModel != DYN_MODEL_AIRBORNE4g)
-  {
-    Serial.println(F("*** Warning: getDynamicModel failed ***"));
+  if(serialDebug){
+    // Let's read the new dynamic model to see if it worked
+    uint8_t newDynamicModel = myGNSS.getDynamicModel();
+    if (newDynamicModel != DYN_MODEL_AIRBORNE4g)
+    {
+      Serial.println(F("*** Warning: getDynamicModel failed ***"));
+    }
+    else
+    {
+      Serial.print(F("The new dynamic model is: "));
+      Serial.println(newDynamicModel);
+    }
   }
-  else
-  {
-    Serial.print(F("The new dynamic model is: "));
-    Serial.println(newDynamicModel);
-  }
-  #endif
 
   myGNSS.saveConfiguration(); //Save the current settings to flash and BBR
 
-  #ifndef FLIGHT
-  Serial.println("GNSS Conected");
-  #endif
+  if(serialDebug)
+    Serial.println("GNSS Conected");
 
   ////////////
   ////CONT////
   ////////////
-  #ifndef FLIGHT
-  Serial.println(F("Checking CONT... "));
-  #endif
+  if(serialDebug)
+    Serial.println(F("Checking CONT... "));
     if(!(analogRead(CONT1) >= 380)){
-    #ifndef FLIGHT
-    Serial.println(analogRead(CONT1));
-    #endif
-    errorCode1();
+      if(serialDebug)
+        Serial.println(analogRead(CONT1));
+      errorCode1();
   }
+
   if(!(analogRead(CONT2) >= 380)){
-    #ifndef FLIGHT
-    Serial.println(analogRead(CONT2));
-    #endif
+    if(serialDebug)
+      Serial.println(analogRead(CONT2));
     errorCode1();
   }
 
@@ -474,21 +514,21 @@ void setup() {
   ////RADIO///
   ////////////
 
-  #ifndef FLIGHT
   // initialize SX1262 with default settings
-  Serial.print(F("[SX1262] Initializing ... "));
-  #endif
+  if(serialDebug)
+    Serial.print(F("[SX1262] Initializing ... "));
 
 
   //set freq to 915, bandwidth 125khz, spreading factor SF7, Coding Rate 4/5, private header 0x12, +22 dBm, no TXO, NO LDO (false)
   int state = radio.begin(LORA_FREQ,LORA_BAND,8,5,RADIOLIB_SX126X_SYNC_WORD_PRIVATE,LORA_PdBm,8,0,false);
   if (state == RADIOLIB_ERR_NONE) {
-    #ifndef FLIGHT
-    Serial.println(F("success!"));
-    #endif
+    if(serialDebug)
+      Serial.println(F("success!"));
   } else {
-    Serial.print(F("failed, code "));
-    Serial.println(state);
+    if(serialDebug){
+      Serial.print(F("failed, code "));
+      Serial.println(state);
+    }
     errorCode1();
   }
 
@@ -497,22 +537,19 @@ void setup() {
   //Function called when when packet transmission is finished
   radio.setPacketSentAction(setFlag);
 
-  #ifndef FLIGHT
-  Serial.println("Radio Initalized");
-  #endif
+  if(serialDebug)
+    Serial.println("Radio Initalized");
 
   // send the first packet on this node
-  #ifndef FLIGHT
-  Serial.print(F("FFCv3_Pinging..."));
-  #endif
+  if(serialDebug)
+    Serial.print(F("FFCv3_Pinging..."));
 
   transmissionState = radio.startTransmit("PING");
   transmittedFlag = true;
   lastTransmition = micros();
 
-  #ifndef FLIGHT
-  Serial.println("Initializing buffers...");
-  #endif
+  if(serialDebug)
+    Serial.println("Initializing buffers...");
 
   // Initialize moving average samples and sum
   for (int i = 0; i < numSamples; i++) {
@@ -520,29 +557,8 @@ void setup() {
     accelSamples[i] = 0.0;
   }
 
-  // Determine primary axis for flight direction based on initial attitude
-  sensors_event_t accel;
-  lsm6dsox.getEvent(&accel, NULL, NULL);
-  double x = abs(accel.acceleration.x);
-  double y = abs(accel.acceleration.y);
-  double z = abs(accel.acceleration.z);
-
-  if (x > y && x > z) mainAxis = 0;
-  else if (y > x && y > z) mainAxis = 1;
-  else mainAxis = 2;
-
-  #ifndef FLIGHT
-  Serial.print("Primary axis for acceleration: ");
-  Serial.println(mainAxis == 0 ? "X" : mainAxis == 1 ? "Y" : "Z");
-  #endif
-
-  lsm6dsox.getEvent(&accel, NULL, NULL);
-
-  double acceleration = mainAxis == 0 ? accel.acceleration.x : mainAxis == 1 ? accel.acceleration.y : accel.acceleration.z;
-
-  #ifndef FLIGHT
-  Serial.println("FFCV3 Initialized! Awaiting Liftoff....");
-  #endif
+  if(serialDebug)
+    Serial.println("FFCV3 Initialized! Awaiting Liftoff....");
 
   flightState = 1; //Set Flight State to Waiting at PAD
 
@@ -550,18 +566,15 @@ void setup() {
     setupCamera();
   }
 
-  delay(1000);
+  delay(3000);
+
+  if(isCamera){
+    startRecording();
+  }
 
   //analogWriteResolution(12);
   //batteryVoltage = 2.0 * 3.3 * analogRead(VBAT) /  4095.0; <- this is for the newest FC
-
-  #ifndef FLIGHT
-  Serial.println(batteryVoltage);
-  #endif
-
   //beepBatV(batteryVoltage); //beep out battery voltage
-
-  //TODO <- beep out main altitude
 
   delay(1000);
 }
@@ -573,8 +586,6 @@ void setup() {
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 void loop() {
-  unsigned long currentTime = micros();
-
   if (baroReady) {
     baroReady = false;
 
@@ -585,6 +596,21 @@ void loop() {
     double realTemperature = data.temperature;
     double realPressure = data.pressure;
 
+    if (barBaselineSet) {
+      currentAltitude = 44330.0 * (1.0 - pow(movingAverage / baselinePressure, 0.1903));
+
+      // Update trend-based velocity
+      unsigned long currentTime = micros();
+      if (currentTime - previousBaroTime >= 100000) {  // 500 ms interval for trend calculation
+        float deltaAltitude = currentAltitude - lastAltitude;
+        float deltaTime = (currentTime - previousBaroTime) / 1.0e6; // Convert to seconds
+        baroVelocity = deltaAltitude / deltaTime;  // Calculate trend-based velocity
+        // Reset trend variables
+        lastAltitude = currentAltitude;
+        previousBaroTime = currentTime;
+      }
+    } 
+    
     // Update moving average for barometric pressure
     pressureSum -= pressureSamples[sampleIndex];
     pressureSamples[sampleIndex] = realPressure;
@@ -593,29 +619,14 @@ void loop() {
 
     movingAverage = pressureSum / numSamples;
 
-     if (!barBaselineSet && sampleIndex == 0) {  // Set baseline after buffer fills
+    if (!barBaselineSet && sampleIndex == 0) {  // Set baseline after buffer fills
       baselinePressure = movingAverage;
       barBaselineSet = true;
 
-      #ifndef FLIGHT
-      Serial.println("Baseline pressure set for relative altitude calculation.");
-      #endif
+      if(serialDebug)
+        Serial.println("Baseline pressure set for relative altitude calculation.");
     }
 
-    if (barBaselineSet) {
-      currentAltitude = 44330.0 * (1.0 - pow(movingAverage / baselinePressure, 0.1903));
-
-      // Update trend-based velocity
-      if (currentTime - previousBaroTime >= 100000) {  // 500 ms interval for trend calculation
-        float deltaAltitude = currentAltitude - lastAltitude;
-        float deltaTime = (currentTime - previousBaroTime) / 1.0e6; // Convert to seconds
-        baroVelocity = deltaAltitude / deltaTime;  // Calculate trend-based velocity
-
-        // Reset trend variables
-        lastAltitude = currentAltitude;
-        previousBaroTime = currentTime;
-      }
-    } 
   }
 
   if(accelReady){
@@ -623,10 +634,17 @@ void loop() {
     // Get IMU acceleration on the main axis
     sensors_event_t accel;
     lsm6dsox.getEvent(&accel, NULL, NULL);
-
+    
     double acceleration = mainAxis == 0 ? accel.acceleration.x : mainAxis == 1 ? accel.acceleration.y : accel.acceleration.z;
+    
+    acceleration *= axisSign; //set axis sign - Positive 9.81 on pad startup
+    acceleration -= 9.81; //subtract gravitational force vector
 
-    acceleration *= imuFlip;
+    unsigned long currentTime = micros();
+    // Integrate raw acceleration for velocity
+    accel_dt = currentTime - lastAccelTime;
+    accelVelocity += acceleration * accel_dt * 0.000001;
+    lastAccelTime = currentTime;
 
     // Update moving average buffer
     accelSum -= accelSamples[accelIndex];
@@ -634,30 +652,16 @@ void loop() {
     accelSum += acceleration;
     accelIndex = (accelIndex + 1) % numSamples;
 
-    // Integrate raw acceleration for velocity
-    accel_dt = micros() - lastAccelTime;
-    accelVelocity += (acceleration - 9.81) * accel_dt * 0.000001;
-    lastAccelTime = micros();
-
     // Compute moving average only after buffer is filled
     if (!accelBaselineSet && accelIndex == 0) {
       accelBaselineSet = true;  // Set baseline once the buffer is full
-      #ifndef FLIGHT
-      Serial.println("IMU baseline set.");
-      #endif
+      if(serialDebug)
+        Serial.println("IMU baseline set.");
     }
 
     //Calculate moving average and flip if necessary
     if (accelBaselineSet) {
       movingAvgAccel = accelSum / numSamples;
-
-      if(movingAvgAccel > 0 && !imuFlipped){
-        imuFlipped = true;
-        imuFlip = -1.0;
-        #ifndef FLIGHT
-        Serial.println("IMU FLIPPED....");
-        #endif
-      } 
     }
   }
 
@@ -667,19 +671,36 @@ void loop() {
     latitude = myGNSS.getLatitude(); longitude = myGNSS.getLongitude(); gnssAltitude = myGNSS.getAltitude(); SIV = myGNSS.getSIV();
   }
 
-  batteryVoltage = 2.0 * 3.3 * analogRead(VBAT) /  1023.0; //experimental update battery shit
+  //batteryVoltage = 2.0 * 3.3 * analogRead(VBAT) /  1023.0; //experimental update battery shit
+
+  if(gyroReady){
+    gyroReady = false;
+
+    unsigned long currentTime = micros();
+    float gyroDt = (currentTime-lastGyroTime) / 1.0e6;
+    lastGyroTime = currentTime;
+
+    sensors_event_t gyro;
+
+    lsm6dsox.getEvent(NULL, &gyro, NULL);
+    //integrate dps of each axis to get angle
+    totalXrot += gyro.gyro.x * gyroDt;
+    totalYrot += gyro.gyro.y * gyroDt;
+    totalZrot += gyro.gyro.z * gyroDt;
+  }
 
   //Gain Definitions
   if(!liftoffDetected){
-    baroWeight = 0.99;
-    accelWeight = 0.01;
-  }else if(liftoffDetected && filteredVelocity <= 600 && movingAvgAccel >= -6.0){
-    baroWeight = 0.3;
-    accelWeight = 0.7;
-  }else if(liftoffDetected && filteredVelocity > 600 && movingAvgAccel >= -6.0){
+    baroWeight = 0.0;
+    accelWeight = 0.0;
+  }else if(liftoffDetected && !burnoutDetected){
+    baroWeight = 0.0;
+    accelWeight = 1.0;
+  }else if(liftoffDetected && burnoutDetected && accelVelocity <= 300){
     baroWeight = 0.1;
     accelWeight = 0.9;
-  } else{ //this shouldnt happen in but is here just in case, this is the catch for non-acceleration flight (vacuum chamber) or accel failure
+  }
+  else{ //this shouldnt happen in but is here just in case, this is the catch for non-acceleration flight (vacuum chamber) or accel failure
     baroWeight= .9; 
     accelWeight = .1;
   }
@@ -687,50 +708,44 @@ void loop() {
   // Apply complementary filter
   filteredVelocity = baroWeight * baroVelocity + accelWeight * accelVelocity;
 
-
-  //Raw Data Stream (Debugging) -> high bandwidth not recommended
-  if(digitalRead(S0)){
-    #ifndef FLIGHT
-    String str = String(currentAltitude) + "," + String(movingAvgAccel)  + "," + String(baroVelocity) + "," + String(flightState) + "," + String(latitude) + "," + String(longitude) + "," + String(SIV);
-    Serial.println(str);
-    delay(100);
-    #endif
-  }
-
   ////////////////
   //State Machine:
   ////////////////
 
   // Check if liftoff detected by altitude and acceleration thresholds
   if (!liftoffDetected && accelBaselineSet && barBaselineSet) {
-    if ((currentAltitude >= liftoffAltitudeThreshold) || (movingAvgAccel >= (liftoffAccelThreshold - 9.8) && currentAltitude >= 10)){
+    if ((currentAltitude >= liftoffAltitudeThreshold) || (movingAvgAccel >= (liftoffAccelThreshold) && currentAltitude >= 10)){
       liftoffDetected = true;
       digitalWrite(LED_B, LOW);  // Turn on LED for liftoff indication
 
-      #ifndef FLIGHT
-      Serial.println("Liftoff detected.");
-      #endif
+      if(serialDebug)
+        Serial.println("Liftoff detected.");
       
       logData = true;
       liftoffTime = micros();
       flightState = 2;
-
-      if(isCamera){
-        startRecording();
-      }
     }
   }
 
+  if(liftoffDetected && !burnoutDetected && !apogeeDetected && movingAvgAccel < 0.5){
+    burnoutDetected = true;
+
+    if(serialDebug)
+      Serial.println("Motor Burnout Detected");
+  
+    flightState = 3;
+  }
+
   // Apogee Detection (fused velocity)
-  if (liftoffDetected && !apogeeDetected && filteredVelocity < 0.1) { // When trend-based baro velocity ~ 0 at peak
+  if (liftoffDetected && burnoutDetected && !apogeeDetected && filteredVelocity < 0.1) { // When trend-based baro velocity ~ 0 at peak
     apogeeDetected = true;
     apogeeTime = micros();
 
-    #ifndef FLIGHT
-    Serial.println("Apogee detected.");
-    #endif
+    if(serialDebug)
+      Serial.println("Apogee detected.");
 
     digitalWrite(LED_B,HIGH); //turnoff LED for apoggee detection
+
     flightState = 4;
   }
 
@@ -740,9 +755,8 @@ void loop() {
     droguePyroActive = true;
     drogueActivationTime = micros();
 
-    #ifndef FLIGHT
-    Serial.println("Drogue pyro activated for drogue chute.");
-    #endif
+    if(serialDebug)
+      Serial.println("Drogue pyro activated for drogue chute.");
   }
 
   // Main chute deployment at target altitude
@@ -750,9 +764,10 @@ void loop() {
     digitalWrite(PYRO2_MAIN, HIGH);
     mainChutePyroActive = true;
     mainChuteActivationTime = micros();
-    #ifndef FLIGHT
-    Serial.println("Main chute pyro activated.");
-    #endif
+
+    if(serialDebug)
+      Serial.println("Main chute pyro activated.");
+
     flightState = 5;
   }
 
@@ -761,9 +776,8 @@ void loop() {
     flightState = 6;
     landed = true;
 
-    #ifndef FLIGHT
-    Serial.println("landed detected");
-    #endif
+    if(serialDebug)
+      Serial.println("landed detected");
 
     digitalWrite(LED_B,LOW);
 
@@ -778,17 +792,15 @@ void loop() {
   if (!droguePyroOver && droguePyroActive && (micros() - drogueActivationTime >= 1000000)) {
     digitalWrite(PYRO1_DROG, LOW);
     droguePyroOver = true;
-    #ifndef FLIGHT
-    Serial.println("Drogue pyro deactivated.");
-    #endif
+    if(serialDebug)
+      Serial.println("Drogue pyro deactivated.");
   }
 
   if (!mainPyroOver && mainChutePyroActive && (micros() - mainChuteActivationTime >= 1000000)) {
     digitalWrite(PYRO2_MAIN, LOW);
     mainPyroOver = true;
-    #ifndef FLIGHT
-    Serial.println("Main chute pyro deactivated.");
-    #endif
+    if(serialDebug)
+      Serial.println("Main chute pyro deactivated.");
   }
 
   ///////////////////////
@@ -816,9 +828,8 @@ void loop() {
       dataFile.close();
       logData = false;
     }else {
-      #ifndef FLIGHT
-      Serial.println("Error writing to flight_log.csv");
-      #endif
+      if(serialDebug)
+        Serial.println("Error writing to flight_log.csv");
     }
     //re-enable interrupts
     interrupts();
@@ -827,53 +838,55 @@ void loop() {
   //when on pad transmit every 5s to conserve power
   //after liftoff transmit every one second
   //after landing transmit once every 10s for better battery life
-  if(!liftoffDetected){
-    transmitPeriod = 5000000;
-  }else if(liftoffDetected && !landed){
-    transmitPeriod = 1000000;
-  }else{
-    transmitPeriod = 10000000;
-  }
-
-  //packet transmission every 1s
-  if(micros() - lastTransmition >= transmitPeriod && !transmittedFlag){
-    // send another one
-    lastTransmition = micros();
-
-    #ifndef FLIGHT
-    //Serial.print(F("[SX1262] Packet ... "));
-    #endif
-
-    if(liftoffDetected){
-      packetNum++;
+  if(radioEnabled){
+    if(!liftoffDetected){
+      transmitPeriod = 5000000;
+    }else if(liftoffDetected && !landed){
+      transmitPeriod = 1000000;
+    }else{
+      transmitPeriod = 10000000;
     }
 
-    //String str = String(flightState) + "," + String(filteredVelocity) + "," + String(currentAltitude) + "," + String(latitude)  + "," + String(longitude) + "," + String(SIV);
-    String str = String(packetNum) + "," + String(latitude)  + "," + String(longitude) + "," + String(SIV) + "," + String(currentAltitude) + "," + String(flightState) + "," + String(batteryVoltage);
+    //packet transmission every 1s
+    if(micros() - lastTransmition >= transmitPeriod && !transmittedFlag){
+      // send another one
+      lastTransmition = micros();
 
-    transmissionState = radio.startTransmit(str);
-  }
+      if(serialDebug)
+        Serial.print(F("[SX1262] Packet ... "));
 
-  if(transmittedFlag) {
-    // reset flag
-    transmittedFlag = false;
-    if (transmissionState == RADIOLIB_ERR_NONE) {
-      // packet was successfully sent
-      #ifndef FLIGHT
-      //Serial.println(F("transmission finished!"));
-      #endif
-    } else {
-      #ifndef FLIGHT
-      Serial.print(F("failed, code "));
-      Serial.println(transmissionState);
-      #endif
+      if(liftoffDetected){
+        packetNum++;
+      }
+
+      //String str = String(flightState) + "," + String(filteredVelocity) + "," + String(currentAltitude) + "," + String(latitude)  + "," + String(longitude) + "," + String(SIV);
+      String str = String(packetNum) + "," + String(latitude)  + "," + String(longitude) + "," + String(SIV) + "," + String(currentAltitude) + "," + String(flightState) + "," + String(batteryVoltage);
+
+      transmissionState = radio.startTransmit(str);
     }
-    radio.finishTransmit();
+
+    if(transmittedFlag) {
+      // reset flag
+      transmittedFlag = false;
+      if (transmissionState == RADIOLIB_ERR_NONE) {
+        // packet was successfully sent
+        if(serialDebug)
+          Serial.println(F("transmission finished!"));
+      } else {
+        if(serialDebug){
+          Serial.print(F("failed, code "));
+          Serial.println(transmissionState);
+        }
+      }
+
+      radio.finishTransmit();
+
+    }
   }
 
   //beep when standby
-  if (currentTime - lastBeepTime >= 1000000 && !liftoffDetected) {
-    lastBeepTime = currentTime;
+  if (micros() - lastBeepTime >= 1000000 && !liftoffDetected) {
+    lastBeepTime = micros();
     beeperState = !beeperState;
     if(beeperState){
       MyTim->setPWM(channel, BUZ, 4000, 50); // 4kHz , 0% dutycycle

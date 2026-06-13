@@ -147,6 +147,7 @@ unsigned long apogeeTime = 0;
 unsigned long drogueActivationTime = 0;        // Tracks drogue pyro activation time
 unsigned long mainChuteActivationTime = 0;     // Tracks main chute pyro activation time
 
+
 //GNSS Values
 int32_t latitude = 0;
 int32_t longitude = 0;
@@ -183,9 +184,8 @@ void baroIRQ(void){
 }
 
 void gyroIRQ(void){
-  baroReady = true;
+  gyroReady = true;
 }
-
 
 
 // save transmission state between loops
@@ -610,7 +610,7 @@ void loop() {
         previousBaroTime = currentTime;
       }
     } 
-    
+  
     // Update moving average for barometric pressure
     pressureSum -= pressureSamples[sampleIndex];
     pressureSamples[sampleIndex] = realPressure;
@@ -693,14 +693,13 @@ void loop() {
   if(!liftoffDetected){
     baroWeight = 0.0;
     accelWeight = 0.0;
-  }else if(liftoffDetected && !burnoutDetected){
+  } else if(liftoffDetected && !burnoutDetected){
     baroWeight = 0.0;
     accelWeight = 1.0;
-  }else if(liftoffDetected && burnoutDetected && accelVelocity <= 300){
-    baroWeight = 0.1;
-    accelWeight = 0.9;
-  }
-  else{ //this shouldnt happen in but is here just in case, this is the catch for non-acceleration flight (vacuum chamber) or accel failure
+  } else if(liftoffDetected && burnoutDetected && accelVelocity <= 300){
+    baroWeight = 0.05;
+    accelWeight = 0.95;
+  } else{ //this shouldnt happen in but is here just in case, this is the catch for non-acceleration flight (vacuum chamber) or accel failure
     baroWeight= .9; 
     accelWeight = .1;
   }
@@ -713,17 +712,23 @@ void loop() {
   ////////////////
 
   // Check if liftoff detected by altitude and acceleration thresholds
+  //TODO - add accel only liftoff detection & set baseline pressure @ liftoff
   if (!liftoffDetected && accelBaselineSet && barBaselineSet) {
-    if ((currentAltitude >= liftoffAltitudeThreshold) || (movingAvgAccel >= (liftoffAccelThreshold) && currentAltitude >= 10)){
+    if ((currentAltitude >= liftoffAltitudeThreshold) || (movingAvgAccel >= (liftoffAccelThreshold))){
       liftoffDetected = true;
-      digitalWrite(LED_B, LOW);  // Turn on LED for liftoff indication
+      liftoffTime = micros();
 
-      if(serialDebug)
-        Serial.println("Liftoff detected.");
+      current
+
+      peakAltitude = currentAltitude;
+
+      digitalWrite(LED_B, LOW);
       
       logData = true;
-      liftoffTime = micros();
       flightState = 2;
+
+      if (serialDebug) 
+        Serial.println("Liftoff detected.")
     }
   }
 
@@ -771,21 +776,23 @@ void loop() {
     flightState = 5;
   }
 
-  //landing detection
-  if (mainChutePyroActive && baroVelocity >= -1) {
-    flightState = 6;
-    landed = true;
+  if (mainChutePyroActive && !landed && fabs(baroVelocity) < LANDING_VEL_BAND && currentAltitude < LANDING_ALT_CEILING) {
+    if (landingStableStart == 0) {
+      landingStableStart = micros();                 // start the stability timer
+    } else if (micros() - landingStableStart >= LANDING_STABLE_US) {
+      landed = true;
+      flightState = 6;
+      digitalWrite(LED_B, LOW);
 
-    if(serialDebug)
-      Serial.println("landed detected");
+      if (isCamera) 
+        stopRecording();
 
-    digitalWrite(LED_B,LOW);
-
-    if(isCamera){
-      stopRecording();
+      MyTim->setPWM(channel, BUZ, 4000, 50);         // 4 kHz, 50% duty
+      if (serialDebug) 
+        Serial.println("landing detected");
     }
-
-    MyTim->setPWM(channel, BUZ, 4000, 50); // 4kHz, 10% dutycycle
+  } else {
+    landingStableStart = 0;                          // condition broke -> reset timer
   }
 
   // Turn off pyros if they have been on for 1 second
@@ -810,7 +817,7 @@ void loop() {
   //Log Data
   if (logData) {
     //turn off intterupts so avoid memory corruption
-    noInterrupts();
+    //noInterrupts();
     // Log data to file
     if (dataFile && !landed) {
       String dataCol = String(micros() - liftoffTime) + "," + String(currentAltitude) + "," + String(movingAvgAccel) + "," +
@@ -832,7 +839,7 @@ void loop() {
         Serial.println("Error writing to flight_log.csv");
     }
     //re-enable interrupts
-    interrupts();
+    //interrupts();
   }
 
   //when on pad transmit every 5s to conserve power

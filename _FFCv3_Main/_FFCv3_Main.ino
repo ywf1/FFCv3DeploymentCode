@@ -1,15 +1,11 @@
 /*
 Yahya Farag
 Pitt SOAR
-6/5/2026
+6/14/2026
 */
 
 /*
 Development TODO list (in order of prority):
-- 3 axis accel data - TODO
-- Initialize and setup HIGH G accel for logging 
-- update logging strucutre to accomodate high G, gyro, and 3 axis accel
-
 - EEPROM based inflight recovery
 - SPI FLASH data logging - TODO
 - beep out main altitude
@@ -74,8 +70,14 @@ bool radioEnabled = true; //set to false if operating radioless (IREC 2026)
 
 //camera vars (RunCamSplitv4)
 bool isCamera = true;
-uint8_t txBuf[BUFF_SIZE];
-int recState = 0;
+
+//continuity status (informational, not a launch gate)
+bool cont1OK = false;
+bool cont2OK = false;
+
+//SD log flush cadence (periodic flush so an abnormal end doesn't lose buffered data)
+unsigned long lastFlushTime = 0;
+const unsigned long flushInterval = 1000000;   // 1 Hz
 
 
 byte flightState = 0; //startup = 0, idle = 1, liftoff = 2, burnout = 3, apoggee & descent under drogue = 4, descent under main = 5, landing detected = 6;
@@ -99,6 +101,13 @@ unsigned long accel_dt = 0;
 float totalXrot = 0;
 float totalYrot = 0;
 float totalZrot = 0;
+
+//3-axis raw sensor data for logging (TODO: high-G + gyro + 3-axis accel)
+float accelX = 0, accelY = 0, accelZ = 0;     // LSM6DSOX low-G accel, m/s^2 (all 3 axes)
+float gyroX = 0, gyroY = 0, gyroZ = 0;        // LSM6DSOX gyro rates, rad/s
+float hiGx = 0, hiGy = 0, hiGz = 0;           // ADXL375 high-G accel, m/s^2
+unsigned long lastHiGTime = 0;
+const unsigned long hiGInterval = 5000;       // 200 Hz high-G poll (I2C, bounded)
 
 double batteryVoltage = 0; //yeah
 
@@ -127,6 +136,11 @@ unsigned long previousBaroTime = 0;
 unsigned long lastBeepTime = 0.0;
 bool beeperState = false;
 
+// Status-indicator state (LED_B heartbeat + buzzer tones)
+unsigned long lastHeartbeat = 0;
+bool heartbeatOn = false;
+int lastBuzzDuty = -1;            // -1 forces the first setPWM
+
 //imu normalization
 int mainAxis = 2;                              // Axis to use for main acceleration (0=x, 1=y, 2=z)
 double axisSign = 1.0;
@@ -143,6 +157,7 @@ const double liftoffAltitudeThreshold = 50.0;   // Altitude threshold for liftof
 
 const unsigned long apogeeDelay = 1000000;     //Nose over delay time
 unsigned long apogeeTime = 0;     
+double peakAltitude = 0.0;                      // running max altitude (telemetry / apogee backup)
 
 unsigned long drogueActivationTime = 0;        // Tracks drogue pyro activation time
 unsigned long mainChuteActivationTime = 0;     // Tracks main chute pyro activation time
@@ -162,6 +177,12 @@ bool mainPyroOver = false;
 
 bool logData = false;
 bool landed = false;
+
+//landing detection (ported pattern: stable low-and-slow for a sustained window)
+unsigned long landingStableStart = 0;
+const unsigned long LANDING_STABLE_US = 3000000UL;   // 3 s of stability before "landed"
+const double LANDING_VEL_BAND    = 2.0;              // m/s; |baro velocity| must be under this
+const double LANDING_ALT_CEILING = 30.0;             // m above pad; rejects the ~0 m/s instant at apogee
 
 unsigned long liftoffTime = 0;
 
@@ -256,7 +277,7 @@ void setup() {
     if(serialDebug)
       Serial.println("SD Card File Found and Created");
 
-    dataFile.println("Time(us),Altitude(m),Acceleration(mps2),Baro Velocity(mps),Fused Velocity(mps),Accel Velocity(mps), Flight State, Latitude, Longitude, SIV");
+    dataFile.println("Time(us),Altitude(m),Acceleration(mps2),Baro Velocity(mps),Fused Velocity(mps),Accel Velocity(mps),Flight State,Latitude,Longitude,SIV,AccelX(mps2),AccelY(mps2),AccelZ(mps2),HiGx(mps2),HiGy(mps2),HiGz(mps2),GyroX(radps),GyroY(radps),GyroZ(radps)");
     dataFile.flush();
   }
 
@@ -496,57 +517,66 @@ void setup() {
   ////////////
   ////CONT////
   ////////////
+  // Continuity is INFORMATIONAL, not a launch gate. A missing/blown channel must not
+  // brick the FC -- we still want to record and log (e.g. no-pyro test flights). Status
+  // is flagged and signalled with a distinct warning chirp, but setup continues.
   if(serialDebug)
     Serial.println(F("Checking CONT... "));
-    if(!(analogRead(CONT1) >= 380)){
-      if(serialDebug)
-        Serial.println(analogRead(CONT1));
-      errorCode1();
+
+  cont1OK = (analogRead(CONT1) >= 380);
+  cont2OK = (analogRead(CONT2) >= 380);
+
+  if(serialDebug){
+    Serial.print(F("CONT1: "));  Serial.print(cont1OK ? F("OK") : F("OPEN"));
+    Serial.print(F("   CONT2: ")); Serial.println(cont2OK ? F("OK") : F("OPEN"));
   }
 
-  if(!(analogRead(CONT2) >= 380)){
-    if(serialDebug)
-      Serial.println(analogRead(CONT2));
-    errorCode1();
+  if(!cont1OK || !cont2OK){
+    // 3 short warning chirps (non-halting), then carry on
+    for(int i = 0; i < 3; i++){
+      MyTim->setPWM(channel, BUZ, 4000, 50); delay(120);
+      MyTim->setPWM(channel, BUZ, 4000, 0);  delay(120);
+    }
   }
 
   ////////////
   ////RADIO///
   ////////////
 
-  // initialize SX1262 with default settings
-  if(serialDebug)
-    Serial.print(F("[SX1262] Initializing ... "));
-
-
-  //set freq to 915, bandwidth 125khz, spreading factor SF7, Coding Rate 4/5, private header 0x12, +22 dBm, no TXO, NO LDO (false)
-  int state = radio.begin(LORA_FREQ,LORA_BAND,8,5,RADIOLIB_SX126X_SYNC_WORD_PRIVATE,LORA_PdBm,8,0,false);
-  if (state == RADIOLIB_ERR_NONE) {
+  // Only touch the radio if it's enabled -- a radioless config (radioEnabled=false)
+  // must not require the SX1262 to be present or healthy. And if it IS enabled but
+  // init fails, recovery is baro-based and doesn't need telemetry: warn and fly
+  // without the radio rather than halting the flight computer.
+  if(radioEnabled){
     if(serialDebug)
-      Serial.println(F("success!"));
-  } else {
-    if(serialDebug){
-      Serial.print(F("failed, code "));
-      Serial.println(state);
+      Serial.print(F("[SX1262] Initializing ... "));
+
+    //freq, bw 125k, SF8, CR 4/5, private sync, +22dBm, preamble 8, no TCXO, no LDO
+    int state = radio.begin(LORA_FREQ,LORA_BAND,8,5,RADIOLIB_SX126X_SYNC_WORD_PRIVATE,LORA_PdBm,8,0,false);
+    if (state == RADIOLIB_ERR_NONE) {
+      if(serialDebug)
+        Serial.println(F("success!"));
+
+      radio.setCurrentLimit(140);            //allow current high enough for +22dBm
+      radio.setPacketSentAction(setFlag);    //ISR on TX-done
+
+      if(serialDebug){
+        Serial.println("Radio Initalized");
+        Serial.print(F("FFCv3_Pinging..."));
+      }
+
+      transmissionState = radio.startTransmit("PING");
+      transmittedFlag = true;
+      lastTransmition = micros();
+    } else {
+      if(serialDebug){
+        Serial.print(F("radio init failed, code "));
+        Serial.println(state);
+        Serial.println(F("-> continuing WITHOUT radio"));
+      }
+      radioEnabled = false;   // disable TX in the loop; keep flying/logging/recording
     }
-    errorCode1();
   }
-
-  //allow current to be high enough to transmit at +22dBm
-  radio.setCurrentLimit(140);
-  //Function called when when packet transmission is finished
-  radio.setPacketSentAction(setFlag);
-
-  if(serialDebug)
-    Serial.println("Radio Initalized");
-
-  // send the first packet on this node
-  if(serialDebug)
-    Serial.print(F("FFCv3_Pinging..."));
-
-  transmissionState = radio.startTransmit("PING");
-  transmittedFlag = true;
-  lastTransmition = micros();
 
   if(serialDebug)
     Serial.println("Initializing buffers...");
@@ -598,6 +628,7 @@ void loop() {
 
     if (barBaselineSet) {
       currentAltitude = 44330.0 * (1.0 - pow(movingAverage / baselinePressure, 0.1903));
+      if (currentAltitude > peakAltitude) peakAltitude = currentAltitude;   // running peak
 
       // Update trend-based velocity
       unsigned long currentTime = micros();
@@ -634,6 +665,8 @@ void loop() {
     // Get IMU acceleration on the main axis
     sensors_event_t accel;
     lsm6dsox.getEvent(&accel, NULL, NULL);
+
+    accelX = accel.acceleration.x; accelY = accel.acceleration.y; accelZ = accel.acceleration.z; // 3-axis for logging
     
     double acceleration = mainAxis == 0 ? accel.acceleration.x : mainAxis == 1 ? accel.acceleration.y : accel.acceleration.z;
     
@@ -665,6 +698,14 @@ void loop() {
     }
   }
 
+  //High-G accelerometer (ADXL375 on Wire2): polled ~200 Hz for logging during boost.
+  if (micros() - lastHiGTime >= hiGInterval) {
+    lastHiGTime = micros();
+    sensors_event_t he;
+    highGaccel.getEvent(&he);
+    hiGx = he.acceleration.x; hiGy = he.acceleration.y; hiGz = he.acceleration.z;
+  }
+
   //GNSS CHECK if Serial buffer is full
   if (myGNSS.getPVT())
   {
@@ -683,6 +724,7 @@ void loop() {
     sensors_event_t gyro;
 
     lsm6dsox.getEvent(NULL, &gyro, NULL);
+    gyroX = gyro.gyro.x; gyroY = gyro.gyro.y; gyroZ = gyro.gyro.z;   // rates (rad/s) for logging
     //integrate dps of each axis to get angle
     totalXrot += gyro.gyro.x * gyroDt;
     totalYrot += gyro.gyro.y * gyroDt;
@@ -711,24 +753,32 @@ void loop() {
   //State Machine:
   ////////////////
 
-  // Check if liftoff detected by altitude and acceleration thresholds
-  //TODO - add accel only liftoff detection & set baseline pressure @ liftoff
+  // Check if liftoff detected by altitude and acceleration thresholds.
+  // The acceleration spike is the primary trigger (fires within ms of ignition, before
+  // the rocket has risen); the altitude threshold is the backup if accel is missed.
   if (!liftoffDetected && accelBaselineSet && barBaselineSet) {
-    if ((currentAltitude >= liftoffAltitudeThreshold) || (movingAvgAccel >= (liftoffAccelThreshold))){
+    bool accelLiftoff = (movingAvgAccel >= liftoffAccelThreshold);
+    bool altLiftoff   = (currentAltitude >= liftoffAltitudeThreshold);
+    if (accelLiftoff || altLiftoff){
       liftoffDetected = true;
       liftoffTime = micros();
 
-      current
+      // Set baseline pressure @ liftoff (TODO): when the accel spike catches liftoff with
+      // the rocket still ~on the pad, re-freeze the altitude baseline to launch-instant
+      // pressure so pad-sit weather drift can't skew AGL (and the main-deploy altitude).
+      // NOT on an altitude-only trigger -- by then the rocket is already at the threshold
+      // and re-capturing would zero out the real altitude.
+      if (accelLiftoff && currentAltitude < 10.0) {
+        baselinePressure = movingAverage;
+      }
 
-      peakAltitude = currentAltitude;
+      peakAltitude = currentAltitude;   // start peak tracking at liftoff
 
-      digitalWrite(LED_B, LOW);
-      
       logData = true;
       flightState = 2;
 
       if (serialDebug) 
-        Serial.println("Liftoff detected.")
+        Serial.println("Liftoff detected.");
     }
   }
 
@@ -748,8 +798,6 @@ void loop() {
 
     if(serialDebug)
       Serial.println("Apogee detected.");
-
-    digitalWrite(LED_B,HIGH); //turnoff LED for apoggee detection
 
     flightState = 4;
   }
@@ -782,12 +830,10 @@ void loop() {
     } else if (micros() - landingStableStart >= LANDING_STABLE_US) {
       landed = true;
       flightState = 6;
-      digitalWrite(LED_B, LOW);
 
       if (isCamera) 
         stopRecording();
 
-      MyTim->setPWM(channel, BUZ, 4000, 50);         // 4 kHz, 50% duty
       if (serialDebug) 
         Serial.println("landing detected");
     }
@@ -814,32 +860,50 @@ void loop() {
   ///END STATE MACHINE///
   ///////////////////////
 
-  //Log Data
+  //Log Data -- fixed char buffer (no heap churn) + periodic flush.
+  // dtostrf is used instead of snprintf("%f") because STM32 nano-newlib disables
+  // float printf by default; dtostrf is heap-free and always available.
   if (logData) {
-    //turn off intterupts so avoid memory corruption
-    //noInterrupts();
-    // Log data to file
-    if (dataFile && !landed) {
-      String dataCol = String(micros() - liftoffTime) + "," + String(currentAltitude) + "," + String(movingAvgAccel) + "," +
-                       String(baroVelocity) + "," + String(filteredVelocity) + "," + String(accelVelocity) + "," + String(flightState) + "," + String(latitude) 
-                       + "," + String(longitude) + "," + String(SIV);
-      dataFile.println(dataCol);
-      //dataFile.flush();
+    if (dataFile) {
+      char line[256];
+      char fb[16];
+      int n = 0;
+      n += snprintf(line+n, sizeof(line)-n, "%lu,", (unsigned long)(micros() - liftoffTime));
+      n += snprintf(line+n, sizeof(line)-n, "%s,",  dtostrf(currentAltitude, 0, 2, fb));
+      n += snprintf(line+n, sizeof(line)-n, "%s,",  dtostrf(movingAvgAccel, 0, 2, fb));
+      n += snprintf(line+n, sizeof(line)-n, "%s,",  dtostrf(baroVelocity, 0, 2, fb));
+      n += snprintf(line+n, sizeof(line)-n, "%s,",  dtostrf(filteredVelocity, 0, 2, fb));
+      n += snprintf(line+n, sizeof(line)-n, "%s,",  dtostrf(accelVelocity, 0, 2, fb));
+      n += snprintf(line+n, sizeof(line)-n, "%d,",  (int)flightState);
+      n += snprintf(line+n, sizeof(line)-n, "%ld,", (long)latitude);
+      n += snprintf(line+n, sizeof(line)-n, "%ld,", (long)longitude);
+      n += snprintf(line+n, sizeof(line)-n, "%d,",  (int)SIV);
+      n += snprintf(line+n, sizeof(line)-n, "%s,",  dtostrf(accelX, 0, 2, fb));
+      n += snprintf(line+n, sizeof(line)-n, "%s,",  dtostrf(accelY, 0, 2, fb));
+      n += snprintf(line+n, sizeof(line)-n, "%s,",  dtostrf(accelZ, 0, 2, fb));
+      n += snprintf(line+n, sizeof(line)-n, "%s,",  dtostrf(hiGx, 0, 2, fb));
+      n += snprintf(line+n, sizeof(line)-n, "%s,",  dtostrf(hiGy, 0, 2, fb));
+      n += snprintf(line+n, sizeof(line)-n, "%s,",  dtostrf(hiGz, 0, 2, fb));
+      n += snprintf(line+n, sizeof(line)-n, "%s,",  dtostrf(gyroX, 0, 4, fb));
+      n += snprintf(line+n, sizeof(line)-n, "%s,",  dtostrf(gyroY, 0, 4, fb));
+      n += snprintf(line+n, sizeof(line)-n, "%s",   dtostrf(gyroZ, 0, 4, fb));
+
+      dataFile.println(line);
+
+      if (!landed) {
+        // periodic flush so a crash / lost power / undetected-landing doesn't drop data
+        if (micros() - lastFlushTime >= flushInterval) {
+          dataFile.flush();
+          lastFlushTime = micros();
+        }
+      } else {
+        dataFile.flush();
+        dataFile.close();
+        logData = false;
+      }
+    } else if (serialDebug) {
+      Serial.println("Error writing to flight_log.csv");
     }
-    else if(dataFile && landed){
-      String dataCol = String(micros() - liftoffTime) + "," + String(currentAltitude) + "," + String(movingAvgAccel) + "," +
-                       String(baroVelocity) + "," + String(filteredVelocity) + "," + String(accelVelocity) + "," + String(flightState) + "," + String(latitude) 
-                       + "," + String(longitude) + "," + String(SIV);
-      dataFile.println(dataCol);
-      dataFile.flush();
-      dataFile.close();
-      logData = false;
-    }else {
-      if(serialDebug)
-        Serial.println("Error writing to flight_log.csv");
-    }
-    //re-enable interrupts
-    //interrupts();
   }
 
   //when on pad transmit every 5s to conserve power
@@ -891,16 +955,7 @@ void loop() {
     }
   }
 
-  //beep when standby
-  if (micros() - lastBeepTime >= 1000000 && !liftoffDetected) {
-    lastBeepTime = micros();
-    beeperState = !beeperState;
-    if(beeperState){
-      MyTim->setPWM(channel, BUZ, 4000, 50); // 4kHz , 0% dutycycle
-    } else{
-      MyTim->setPWM(channel, BUZ, 4000, 0); // 4kHz , 0% dutycycle
-    }
-  }
+  updateIndicators();   // LED_B heartbeat + buzzer (armed chirp on pad / locator after landing)
 }
 
 //beep function
@@ -913,27 +968,59 @@ void errorCode1(){
   }
 }
 
-// --------- CAMERA INTERFACE FUNCTIONS ---------
-void setupCamera() {
-  //delay(100);  // Optional delay before init
-  rcSerial.begin(115200);
-  delay(1000);  // Allow time for camera to initialize
+// ---- Status indicators: LED_B heartbeat + piezo buzzer state tones ----
+// Reconfigure the buzzer timer ONLY on change; setPWM every loop would glitch it.
+void buzz(uint32_t duty){
+  if ((int)duty != lastBuzzDuty){ MyTim->setPWM(channel, BUZ, 4000, duty); lastBuzzDuty = (int)duty; }
+}
 
-  // Build command to toggle recording
-  txBuf[0] = 0xCC;
-  txBuf[1] = 0x01;  // Command ID
-  txBuf[2] = 0x01;  // Parameter (toggle)
-  txBuf[3] = calcCrc(txBuf, 3);
-  delay(1000);
-  rcSerial.write(txBuf, 4);
+// Called once per loop.
+//   LED_B  : ~2 Hz loop-alive heartbeat -- if it stops blinking, the loop has hung.
+//   Buzzer : slow "armed" chirp on the pad, silent in flight (no one can hear it),
+//            fast attention-getting locator beep once landed (for recovery).
+void updateIndicators(){
+  unsigned long now = micros();
+
+  if (now - lastHeartbeat >= 250000){ lastHeartbeat = now; heartbeatOn = !heartbeatOn; digitalWrite(LED_B, heartbeatOn); }
+
+  if (landed){                                   // recovery locator: fast beep
+    if (now - lastBeepTime >= 200000){ lastBeepTime = now; beeperState = !beeperState; buzz(beeperState ? 50 : 0); }
+  } else if (!liftoffDetected){                  // on the pad: slow armed chirp
+    if (now - lastBeepTime >= 1000000){ lastBeepTime = now; beeperState = !beeperState; buzz(beeperState ? 50 : 0); }
+  } else {                                       // in flight: silent
+    buzz(0);
+  }
+}
+
+// --------- CAMERA INTERFACE FUNCTIONS ---------
+// RunCam Device Protocol (verified against support.runcam.com): command 0x01 =
+// CAMERA_CONTROL; action 0x03 = START recording, 0x04 = STOP recording. These are
+// explicit (idempotent) -- unlike action 0x01 (Simulate Power Button), which only
+// TOGGLES and desyncs if a press is missed or repeated.
+#define RC_CMD_CAMERA_CONTROL    0x01
+#define RC_ACTION_START_RECORDING 0x03
+#define RC_ACTION_STOP_RECORDING  0x04
+
+void sendCamAction(uint8_t action){
+  uint8_t buf[4];
+  buf[0] = 0xCC;                  // header
+  buf[1] = RC_CMD_CAMERA_CONTROL; // command
+  buf[2] = action;                // 0x03 start / 0x04 stop
+  buf[3] = calcCrc(buf, 3);       // crc8 (dvb-s2, poly 0xD5) over the 3 bytes
+  rcSerial.write(buf, 4);
+}
+
+void setupCamera() {
+  rcSerial.begin(115200);
+  delay(1000);  // let the camera's UART come up; do NOT send a control command here
 }
 
 void startRecording() {
-  rcSerial.write(txBuf, 4);
+  sendCamAction(RC_ACTION_START_RECORDING);
 }
 
 void stopRecording() {
-  rcSerial.write(txBuf, 4);
+  sendCamAction(RC_ACTION_STOP_RECORDING);
 }
 
 uint8_t calcCrc(uint8_t *buf, uint8_t numBytes) {

@@ -479,9 +479,7 @@ void setup() {
   // Set up auto PVT message (non-blocking)
   myGNSS.setAutoPVT(true); // Enable automatic NAV PVT messages
   // Set up auto PVT message (non-blocking)
-  myGNSS.setNavigationFrequency(10); // 1 Hz
-  myGNSS.setAutoPVT(true); // Enable automatic NAV PVT messages
-
+  
   //Set Up Dynamic Mode
   if (myGNSS.setDynamicModel(DYN_MODEL_AIRBORNE4g) == false) // Set the dynamic model to PORTABLE
   {
@@ -706,6 +704,8 @@ void loop() {
     hiGx = he.acceleration.x; hiGy = he.acceleration.y; hiGz = he.acceleration.z;
   }
 
+  myGNSS.checkUblox();
+  
   //GNSS CHECK if Serial buffer is full
   if (myGNSS.getPVT())
   {

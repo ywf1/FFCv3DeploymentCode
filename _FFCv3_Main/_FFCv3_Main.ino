@@ -6,6 +6,10 @@ Pitt SOAR
 
 /*
 Development TODO list (in order of prority):
+- 3 axis accel data - DONE (accelX/Y/Z logged)
+- Initialize and setup HIGH G accel for logging - DONE (ADXL375 polled @200Hz, logged)
+- update logging strucutre to accomodate high G, gyro, and 3 axis accel - DONE
+
 - EEPROM based inflight recovery
 - SPI FLASH data logging - TODO
 - beep out main altitude
@@ -479,7 +483,9 @@ void setup() {
   // Set up auto PVT message (non-blocking)
   myGNSS.setAutoPVT(true); // Enable automatic NAV PVT messages
   // Set up auto PVT message (non-blocking)
-  
+  myGNSS.setNavigationFrequency(10); // 1 Hz
+  myGNSS.setAutoPVT(true); // Enable automatic NAV PVT messages
+
   //Set Up Dynamic Mode
   if (myGNSS.setDynamicModel(DYN_MODEL_AIRBORNE4g) == false) // Set the dynamic model to PORTABLE
   {
@@ -704,8 +710,6 @@ void loop() {
     hiGx = he.acceleration.x; hiGy = he.acceleration.y; hiGz = he.acceleration.z;
   }
 
-  myGNSS.checkUblox();
-  
   //GNSS CHECK if Serial buffer is full
   if (myGNSS.getPVT())
   {
@@ -993,34 +997,45 @@ void updateIndicators(){
 }
 
 // --------- CAMERA INTERFACE FUNCTIONS ---------
-// RunCam Device Protocol (verified against support.runcam.com): command 0x01 =
-// CAMERA_CONTROL; action 0x03 = START recording, 0x04 = STOP recording. These are
-// explicit (idempotent) -- unlike action 0x01 (Simulate Power Button), which only
-// TOGGLES and desyncs if a press is missed or repeated.
-#define RC_CMD_CAMERA_CONTROL    0x01
-#define RC_ACTION_START_RECORDING 0x03
-#define RC_ACTION_STOP_RECORDING  0x04
+// This RunCam Split only honors Simulate-Power-Button (command 0x01, action 0x01),
+// which TOGGLES recording -- the explicit START/STOP actions (0x03/0x04) do nothing on
+// this unit (verified on the bench). So we track recording state in firmware and toggle
+// EXACTLY ONCE per start/stop, gated on that state, to avoid the double-toggle that
+// otherwise leaves the camera in the wrong mode. Assumes the camera powers on idle
+// (not recording); if a toggle frame is ever dropped, state can desync -- the camera's
+// record LED on the pad is the ground-truth check before launch.
+#define RC_CMD_CAMERA_CONTROL  0x01
+#define RC_ACTION_POWER_TOGGLE 0x01   // simulate power button = toggle record
+
+bool isRecording = false;             // firmware's view of the camera (off at power-on)
 
 void sendCamAction(uint8_t action){
   uint8_t buf[4];
   buf[0] = 0xCC;                  // header
   buf[1] = RC_CMD_CAMERA_CONTROL; // command
-  buf[2] = action;                // 0x03 start / 0x04 stop
+  buf[2] = action;                // action (0x01 = power-button toggle)
   buf[3] = calcCrc(buf, 3);       // crc8 (dvb-s2, poly 0xD5) over the 3 bytes
   rcSerial.write(buf, 4);
 }
 
 void setupCamera() {
   rcSerial.begin(115200);
-  delay(1000);  // let the camera's UART come up; do NOT send a control command here
+  delay(1000);          // bring up the UART only; send no command here
+  isRecording = false;  // camera powers on not recording
 }
 
 void startRecording() {
-  sendCamAction(RC_ACTION_START_RECORDING);
+  if (!isRecording) {                    // toggle only if we believe it's stopped
+    sendCamAction(RC_ACTION_POWER_TOGGLE);
+    isRecording = true;
+  }
 }
 
 void stopRecording() {
-  sendCamAction(RC_ACTION_STOP_RECORDING);
+  if (isRecording) {                     // toggle only if we believe it's recording
+    sendCamAction(RC_ACTION_POWER_TOGGLE);
+    isRecording = false;
+  }
 }
 
 uint8_t calcCrc(uint8_t *buf, uint8_t numBytes) {
